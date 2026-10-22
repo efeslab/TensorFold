@@ -319,10 +319,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     streams = max(1, int(options.get("parallel") or 1))
     # one stream on one GB10 takes the width it affords (16-row trees, widening to 128); other shapes keep 12 rows
     wide = tp == 1 and streams == 1 and gb10()
-    # perf-study: TENSORFOLD_TREE_ROWS overrides the lone stream's DFlash2 tree rows on a GB10 (16 by default).  At a
-    # ~50k-token context a verify round's fixed cost (weights plus attention over the context) dominates, so 24 rows
-    # land more tokens a round for ~8% more verify time: +4% decode in bench/tf_prof.py.
-    tree = int(__import__("os").environ.get("TENSORFOLD_TREE_ROWS", "16"))
+    # perf-study: the lone stream's DFlash2 tree rows on a GB10, 24 (0.6.6: 16; TENSORFOLD_TREE_ROWS overrides).  At a
+    # ~50k-token context a verify round's fixed cost (weights, plus attention over the context) dominates: 24 rows land
+    # 4.7-5.1 tokens a round against 4.1-4.7 for ~8% more verify time, +3.9% decode served (results/tf-tune); 32 rows
+    # cost more attention than they land.
+    tree = int(__import__("os").environ.get("TENSORFOLD_TREE_ROWS", "24"))
     return Qwen27Engine(Path(model_dir), draft, max_rows=128 if wide else 12, tree_rows=tree if wide else None,
                         tp=tp, rank=rank, master=master, port=master_port,
                         split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts,
