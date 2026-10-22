@@ -148,12 +148,7 @@ def load_nvfp4(model_dir: str | Path, device: str = "cuda"):
             s = got["weight_scale"].float().reshape(-1)
             if s.numel() != 1:
                 raise ValueError(f"{name}: FP8 with {s.numel()} scales; the CUDA engine reads one scale a tensor")
-            act = act_scale(name, got, "fp8")
-            if REQUANT_FP8 and act is not None and prompt:
-                lin = requant_nvfp4(weight, float(s[0]), act, Fp4Linear)
-                lin.staging = staging
-                return lin
-            return Fp8Linear.from_checkpoint(weight, float(s[0]), act=act)
+            return Fp8Linear.from_checkpoint(weight, float(s[0]), act=act_scale(name, got, "fp8"))
         if kind == "bf16":
             w = weight.to(torch.bfloat16).contiguous()
             return Plain8(w, rows8=Fp8Linear.from_bf16(w)) if prompt and prompt_precision.fp8() else Plain(w)
@@ -206,34 +201,6 @@ def load_nvfp4(model_dir: str | Path, device: str = "cuda"):
         raise ValueError(f"unused checkpoint tensors: {left[:5]} ...")
     torch.cuda.empty_cache()
     return w
-
-
-# perf-study, OPT-IN (changes the model's numbers): TENSORFOLD_REQUANT_FP8=1 requantizes the checkpoint's per-tensor
-# FP8 projections (attention q/k/v/o, DeltaNet in_proj_qkv/z and out_proj: ~7 GB a decode round) to NVFP4 at load, so
-# they read half the bytes on the same FP4 lane matmul the checkpoint's own NVFP4 layers use.
-REQUANT_FP8 = __import__("os").environ.get("TENSORFOLD_REQUANT_FP8", "0") == "1"
-_E2M1_MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)          # midpoints of 0, .5, 1, 1.5, 2, 3, 4, 6
-
-
-def requant_nvfp4(weight: torch.Tensor, scale: float, act: float, cls):
-    """A ModelOpt per-tensor FP8 projection as NVFP4: e2m1 codes, e4m3 scales per 16 inputs, one global scale.
-
-    The weight is dequantized (codes * scale), its global scale set from its amax (amax / (6 * 448)), each 16-input
-    block scaled by its own amax / 6 rounded to e4m3, and the codes rounded to the nearest e2m1 value.  The static
-    input scale follows the same amax: FP8's amax / 448 becomes NVFP4's amax / (6 * 448), i.e. ``act / 6``.
-    """
-
-    w = weight.view(torch.float8_e4m3fn).float() * scale
-    n, k = w.shape
-    g = float(w.abs().max()) / (6.0 * 448.0) or 1.0
-    blocks = w.view(n, k // 16, 16)
-    bscale = (blocks.abs().amax(-1) / 6.0 / g).clamp(max=448.0).to(torch.float8_e4m3fn)
-    div = bscale.float() * g
-    q = blocks / torch.where(div > 0, div, torch.ones_like(div))[..., None]
-    mag = torch.bucketize(q.abs().clamp(max=6.0), torch.tensor(_E2M1_MID, device=w.device))
-    codes = (mag | ((q < 0) & (mag > 0)).to(mag.dtype) << 3).to(torch.uint8).view(n, k)
-    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
-    return cls.from_checkpoint(packed, bscale.view(n, k // 16), g, act=act / 6.0)
 
 
 def fuse_gate_up(layers) -> int:
