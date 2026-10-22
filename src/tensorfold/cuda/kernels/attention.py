@@ -16,10 +16,6 @@ CHUNK = 512
 GROUP = 4               # chunks folded into one fp32 partial
 SPAN = CHUNK * GROUP
 MIN_GROUPED = 64        # groups times window rows needed to keep enough programs busy
-# perf-study: launch shape of ``_shared`` (the committed-key chunks, the bulk of decode attention at long context).
-# Pipelining depth and warps change how loads overlap, not the arithmetic.  Read at each launch so a profiler can sweep.
-SHARED_WARPS = int(__import__("os").environ.get("TENSORFOLD_ATTN_WARPS", "4"))
-SHARED_STAGES = int(__import__("os").environ.get("TENSORFOLD_ATTN_STAGES", "1"))
 MAX_NODES = 128
 QUERY_TILE = 16
 MERGE_COLUMNS = 64      # output columns a merge program folds (the chunk fold is per column: more programs, same bits)
@@ -332,8 +328,8 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     partial_l = torch.empty_like(partial_m)
     if p.items.shape[0]:
         _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m, partial_l,
-                                          w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, GR=GROUP,
-                                          num_warps=SHARED_WARPS, num_stages=SHARED_STAGES)
+                                          w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, GR=GROUP, num_warps=4,
+                                          num_stages=1)
     tails = 1 + -(-MAX_NODES // CHUNK)
     _tail[(w, hk, tails)](q, k_nodes, v_nodes, origin, origin, offs, p.streams, p.rows, p.paths, p.depths,
                           partial_o, partial_m, partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, MAXD=MAX_NODES,
