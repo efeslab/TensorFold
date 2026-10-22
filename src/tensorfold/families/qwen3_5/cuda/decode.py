@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 import time
 from typing import Callable, Sequence
 
@@ -14,17 +13,6 @@ from tensorfold.engine.exact_sampling import Sampling
 from .forward import State, _paths, commit, tree_forward
 from tensorfold.cuda.sampling import sample_rows
 from .weights import Weights
-
-
-# perf-study: the per-stage timers synchronize the device three times a round, which stops the host from queueing
-# the next stage's launches while the GPU is still busy.  TENSORFOLD_STAGE_SYNC=0 keeps only the synchronizations
-# the loop needs (the sampler and the drafter read their results on the host); stage times then become approximate.
-STAGE_SYNC = os.environ.get("TENSORFOLD_STAGE_SYNC", "1") != "0"
-
-
-def _stage_sync() -> None:
-    if STAGE_SYNC:
-        torch.cuda.synchronize()
 
 
 def clone_state(st: State) -> State:
@@ -250,13 +238,13 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if constraint is not None:           # a grammar drops drafts no path can keep, then masks each row by its path
             window = constraint.window(tokens, tree_parents)
             tokens, tree_parents = window.tokens, window.parents
-        _stage_sync()
+        torch.cuda.synchronize()
         spent = {"draft": time.perf_counter() - stage}
         stages["draft"] += spent["draft"]
         stage = time.perf_counter()
         logits, record, *tapped = tree_forward(
             w, _tokens(tokens, w.norm.device), tree_parents, st, capture_taps=draft is not None)
-        _stage_sync()
+        torch.cuda.synchronize()
         spent["verify"] = time.perf_counter() - stage
         stages["verify"] += spent["verify"]
         stage = time.perf_counter()
@@ -295,7 +283,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         out.append(terminal)
         context.extend(tokens[row] for row in path[1:])
         context.append(terminal)
-        _stage_sync()
+        torch.cuda.synchronize()
         stages["commit"] += time.perf_counter() - stage
         if trace is not None:
             trace[-1]["commit_ms"] = round(1000 * (time.perf_counter() - stage), 3)
