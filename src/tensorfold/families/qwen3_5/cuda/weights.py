@@ -203,6 +203,7 @@ class Layer:
     up: QLinear | None
     down: QLinear | None
     moe: Any = None           # routed experts and a shared expert (``tensorfold.cuda.moe``) instead of gate/up/down
+    gate_up: Any = None       # perf-study: [gate | up] as one checkpoint-math NVFP4 projection (``nvfp4_load.fuse_gate_up``)
 
 
 @dataclass

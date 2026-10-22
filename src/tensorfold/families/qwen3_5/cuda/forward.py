@@ -59,7 +59,10 @@ def _mlp(layer, h: torch.Tensor, xs: torch.Tensor, tp: bool) -> torch.Tensor:
         if tp:
             raise ValueError("routed experts run on one GPU")
         return moe.run(h, layer.moe)
-    act, act_xs = glue.swiglu(*_mm_group(h, [layer.gate, layer.up], xs))
+    if layer.gate_up is not None and not tp:        # perf-study: one stacked launch, the same bits
+        act, act_xs = glue.swiglu_stacked(_mm(h, layer.gate_up, xs))
+    else:
+        act, act_xs = glue.swiglu(*_mm_group(h, [layer.gate, layer.up], xs))
     return _row_mm(act, layer.down, tp, act_xs)
 
 

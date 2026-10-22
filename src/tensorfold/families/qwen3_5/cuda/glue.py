@@ -128,13 +128,13 @@ def gated_norm(y: torch.Tensor, z: torch.Tensor, w: torch.Tensor, eps: float):
 
 
 @triton.jit
-def _swiglu(GATE, UP, OUT, XS, N: tl.constexpr, BLOCK: tl.constexpr):
+def _swiglu(GATE, UP, OUT, XS, N: tl.constexpr, BLOCK: tl.constexpr, LD: tl.constexpr):
     row = tl.program_id(0)
     blk = tl.program_id(1)
     offs = blk * BLOCK + tl.arange(0, BLOCK)
     ok = offs < N
-    g = tl.load(GATE + row * N + offs, mask=ok, other=0.0).to(tl.float32)
-    u = tl.load(UP + row * N + offs, mask=ok, other=0.0).to(tl.float32)
+    g = tl.load(GATE + row * LD + offs, mask=ok, other=0.0).to(tl.float32)
+    u = tl.load(UP + row * LD + offs, mask=ok, other=0.0).to(tl.float32)
     a = (g * tl.sigmoid(g) * u).to(tl.bfloat16)
     tl.store(OUT + row * N + offs, a, mask=ok)
     ag = tl.reshape(a.to(tl.float32), (BLOCK // 64, 64))
@@ -147,7 +147,19 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor):
     out = torch.empty_like(gate)
     xs = torch.empty((W, n // 64), dtype=torch.float32, device=gate.device)
     block = 1024
-    _swiglu[(W, triton.cdiv(n, block))](gate, up, out, xs, N=n, BLOCK=block, num_warps=4)
+    _swiglu[(W, triton.cdiv(n, block))](gate, up, out, xs, N=n, BLOCK=block, LD=n, num_warps=4)
+    return out, xs
+
+
+def swiglu_stacked(gu: torch.Tensor):
+    """``swiglu`` of a ``[gate | up]`` projection's rows (perf-study: the stacked decode launch): the same bits."""
+
+    W, n2 = gu.shape
+    n = n2 // 2
+    out = torch.empty((W, n), dtype=gu.dtype, device=gu.device)
+    xs = torch.empty((W, n // 64), dtype=torch.float32, device=gu.device)
+    block = 1024
+    _swiglu[(W, triton.cdiv(n, block))](gu, gu[:, n:], out, xs, N=n, BLOCK=block, LD=n2, num_warps=4)
     return out, xs
 
 
