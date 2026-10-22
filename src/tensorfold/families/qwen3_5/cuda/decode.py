@@ -215,8 +215,7 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
                  *, max_rows: int = 128, tree_rows: int | None = None,
                  allow_copy: bool = True, stop_eos: bool = True,
                  on_tokens: Callable[[list[int]], bool | None] | None = None,
-                 trace: list | None = None, inplace: bool = False, constraint=None,
-                 choose_rows: Callable[[list[float]], int] | None = None) -> DecodeResult:
+                 trace: list | None = None, inplace: bool = False, constraint=None) -> DecodeResult:
     """Verify trees and replay matching paths; copies grow from ``tree_rows``, doubling while they land whole."""
 
     if count < 1 or not 1 <= max_rows <= 128:
@@ -240,13 +239,6 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
         if copied:
             guesses = copied
             parents = list(range(-1, len(guesses) - 1))
-        elif draft is not None and choose_rows is not None:
-            # perf-study: draft a wide tree, then verify the pop-order prefix ``choose_rows`` picks from its path scores
-            # (a prefix of pop order is a tree: parents pop first); drafts only propose, so replies are unchanged
-            guesses, parents, scores = draft.finish_tree(draft.launch_block(out[-1], max_rows - 1), len(context),
-                                                         max_rows - 1, sampling)
-            keep = max(1, min(len(guesses), int(choose_rows(scores)))) if guesses else 0
-            guesses, parents = guesses[:keep], parents[:keep]
         elif draft is not None:
             guesses, parents = draft.propose_tree(
                 out[-1], len(context), tree_rows - 1, sampling)
@@ -318,26 +310,3 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     return DecodeResult(out, time.perf_counter() - start, rounds, drafted_rows,
                         accepted_drafts, stages["draft"], stages["verify"],
                         stages["sample"], stages["commit"], widths)
-
-
-def rate_rows(verify_ms: Callable[[int], float], overhead_ms: float, calibration: float = 1.0,
-              floor: int = 1) -> Callable[[list[float]], int]:
-    """perf-study: a ``choose_rows`` for ``draft_decode``: the draft count whose window maximizes expected tokens per ms.
-
-    A pop-order node's path score s gives exp(-calibration * s) as its chance of landing; a window of k drafts then
-    lands 1 + sum of the first k chances, and costs ``verify_ms(k + 1)`` plus ``overhead_ms`` (draft, commit, host).
-    """
-
-    import math
-
-    def choose(scores: list[float]) -> int:
-        best, best_k, landed = 1.0 / (verify_ms(1) + overhead_ms), 0, 1.0
-        for k, s in enumerate(scores, 1):
-            landed += math.exp(-calibration * s)
-            rate = landed / (verify_ms(k + 1) + overhead_ms)
-            if rate > best:
-                best, best_k = rate, k
-        return max(floor, best_k)
-
-    return choose
-
