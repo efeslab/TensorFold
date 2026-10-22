@@ -17,7 +17,11 @@ GROUP = 4               # chunks folded into one fp32 partial
 SPAN = CHUNK * GROUP
 MIN_GROUPED = 64        # groups times window rows needed to keep enough programs busy
 MAX_NODES = 128
-QUERY_TILE = 16
+# perf-study: (row, head) pairs a ``_shared`` program attends.  Each program reads its chunk's keys and values, so a
+# 16-row window with 6 query heads a key head (96 pairs) read every chunk 6 times; wider tiles read it fewer times.
+# A pair's arithmetic does not depend on the other pairs in its tile.  Read at each launch (a profiler can sweep).
+QUERY_TILE = int(__import__("os").environ.get("TENSORFOLD_ATTN_QTILE", "16"))
+SHARED_WARPS = int(__import__("os").environ.get("TENSORFOLD_ATTN_WARPS", "4"))
 MERGE_COLUMNS = 64      # output columns a merge program folds (the chunk fold is per column: more programs, same bits)
 
 
@@ -67,7 +71,7 @@ def _fold(m, l, o, cm, cl, co):
 
 @triton.jit
 def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
-            G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, GR: tl.constexpr):
+            G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, GR: tl.constexpr, QT: tl.constexpr):
     """An item code is a whole group j >= 0, or chunk -1-j after the whole groups."""
 
     item = tl.program_id(0) // HK            # a chunk's heads and query tiles launch together: one DRAM read
@@ -86,22 +90,22 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, H: tl.constexpr, HK: t
     if ((chunk + n) * CH <= p) & (code < groups):     # a padded plan (a graph's) skips what the keys don't fill
         koff = tl.multiple_of(tl.load(OFF + s * 2), 8)     # ``offsets`` checks 16 bytes: loads go 16 bytes wide
         voff = tl.multiple_of(tl.load(OFF + s * 2 + 1), 8)
-        rr = first + tl.arange(0, 16)
+        rr = first + tl.arange(0, QT)
         ok = rr < rows * G
         node = start + rr // G
         head = hk * G + rr % G
         d = tl.arange(0, D)
         q = tl.load(Q + (node[:, None] * H + head[:, None]) * D + d[None, :], mask=ok[:, None],
                     other=0).to(tl.bfloat16)
-        gm = tl.full((16,), float("-inf"), tl.float32)
-        gl = tl.zeros((16,), tl.float32)
-        go = tl.zeros((16, D), tl.float32)
+        gm = tl.full((QT,), float("-inf"), tl.float32)
+        gl = tl.zeros((QT,), tl.float32)
+        go = tl.zeros((QT, D), tl.float32)
         m, l, o = gm, gl, go
         for c in range(n):
             key = (chunk + c) * CH + tl.arange(0, 64)
-            m = tl.full((16,), float("-inf"), tl.float32)
-            l = tl.zeros((16,), tl.float32)
-            o = tl.zeros((16, D), tl.float32)
+            m = tl.full((QT,), float("-inf"), tl.float32)
+            l = tl.zeros((QT,), tl.float32)
+            o = tl.zeros((QT, D), tl.float32)
             for t in range(CH // 64):
                 ki = key + t * 64
                 kk = tl.load(KC + koff + (ki[:, None] * HK + hk) * D + d[None, :]).to(tl.bfloat16)
@@ -328,8 +332,8 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     partial_l = torch.empty_like(partial_m)
     if p.items.shape[0]:
         _shared[(p.items.shape[0] * hk,)](q, origin, origin, offs, p.streams, p.items, partial_o, partial_m, partial_l,
-                                          w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, GR=GROUP, num_warps=4,
-                                          num_stages=1)
+                                          w, H=h, HK=hk, D=d, G=g, CH=CHUNK, SCALE=scale, GR=GROUP, QT=QUERY_TILE,
+                                          num_warps=SHARED_WARPS, num_stages=1)
     tails = 1 + -(-MAX_NODES // CHUNK)
     _tail[(w, hk, tails)](q, k_nodes, v_nodes, origin, origin, offs, p.streams, p.rows, p.paths, p.depths,
                           partial_o, partial_m, partial_l, w, H=h, HK=hk, D=d, G=g, CH=CHUNK, MAXD=MAX_NODES,
