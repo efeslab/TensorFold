@@ -118,9 +118,13 @@ class Qwen27Engine:
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
             from .dflash2 import DFlash2
+            import os
+            # perf-study: TENSORFOLD_DRAFT_BITS=16 keeps the one-GPU drafter's projections bf16 (unfused path) instead
+            # of the default 4-bit lane matmuls; drafts only propose, so replies are unchanged
+            draft_bits = int(os.environ.get("TENSORFOLD_DRAFT_BITS", "4"))
 
             # tp_draft: both ranks hold half the drafter and draft together (rank 1 needs --draft too)
-            self.draft = DFlash2(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else DFlash2(draft_dir, full)
+            self.draft = DFlash2(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else DFlash2(draft_dir, full, bits=draft_bits)
         del full
         if vision and rank == 0:
             from tensorfold.vision.qwen_cuda import QwenCudaVision
