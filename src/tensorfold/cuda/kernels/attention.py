@@ -13,12 +13,9 @@ import triton.language as tl
 
 TILE = 64
 CHUNK = 512
-GROUP = int(__import__("os").environ.get("TENSORFOLD_ATTN_GROUP", "4"))   # chunks folded into one fp32 partial
+GROUP = 4               # chunks folded into one fp32 partial
 SPAN = CHUNK * GROUP
-# groups times window rows needed to keep enough programs busy (perf-study: TENSORFOLD_ATTN_MIN_GROUPED; a group's
-# fold runs the merge's arithmetic in the merge's order, so whether chunks fold in their program or in the merge does
-# not change a row's bits)
-MIN_GROUPED = int(__import__("os").environ.get("TENSORFOLD_ATTN_MIN_GROUPED", "64"))
+MIN_GROUPED = 64        # groups times window rows needed to keep enough programs busy
 MAX_NODES = 128
 # perf-study: (row, head) pairs a ``_shared`` program attends.  Each program reads its chunk's keys and values, so a
 # 16-row window with 6 query heads a key head (96 pairs) read every chunk 6 times; wider tiles read it fewer times.
