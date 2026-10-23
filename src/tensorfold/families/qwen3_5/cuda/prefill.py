@@ -8,7 +8,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-from tensorfold.cuda import moe, prompt_precision
+from tensorfold.cuda import moe, nvtx, prompt_precision
 from tensorfold.cuda.kernels import gdn as deltanet
 from tensorfold.cuda.kernels import qmm as shared
 from tensorfold.cuda.kernels.prefill_attention import attention
@@ -200,8 +200,11 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
             kept = (clone_state(st), draft.snapshot() if draft is not None else None)
         cut = keep_at - a if keep_at is not None and a < keep_at < b else 0
         want = draft is not None and b > tap_from
-        normed, taps, *part = prefill_chunk(w, ids[a - base:b - base], st, tp=tp, capture_taps=want,
-                                            last=j == len(spans) - 1, cut=cut, vision=vision)
+        chunk_ns, pos0 = nvtx.now(), st.pos
+        with nvtx.span("tensorfold.prefill.chunk"):
+            normed, taps, *part = prefill_chunk(w, ids[a - base:b - base], st, tp=tp, capture_taps=want,
+                                                last=j == len(spans) - 1, cut=cut, vision=vision)
+        nvtx.record("prefill_chunk", chunk_ns, pos=pos0, rows=b - a, last=j == len(spans) - 1)
         snap = None
         if want:
             rows = taps[max(0, tap_from - a):]

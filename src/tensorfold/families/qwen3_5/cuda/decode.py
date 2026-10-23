@@ -8,6 +8,8 @@ from typing import Callable, Sequence
 
 import torch
 
+from tensorfold.cuda import nvtx
+
 from tensorfold.engine.exact_sampling import Sampling
 
 from .forward import State, _paths, commit, tree_forward
@@ -222,79 +224,88 @@ def draft_decode(w: Weights, st: State, prompt: Sequence[int], pending: int,
     start = time.perf_counter()
     stopped = False
     while len(out) < count and (not stop_eos or out[-1] not in w.config.eos) and not stopped:
-        stage = time.perf_counter()
-        copied = copies.propose(context, copy_rows - 1) if copies is not None else []
-        if copied:
-            guesses = copied
-            parents = list(range(-1, len(guesses) - 1))
-        elif draft is not None:
-            guesses, parents = draft.propose_tree(
-                out[-1], len(context), tree_rows - 1, sampling)
-        else:                                # no draft model: one row a round unless the context offers a copy
-            guesses, parents = [], []
-        tokens = [out[-1]] + guesses
-        tree_parents = [-1] + [0 if p < 0 else p + 1 for p in parents]
-        window = None
-        if constraint is not None:           # a grammar drops drafts no path can keep, then masks each row by its path
-            window = constraint.window(tokens, tree_parents)
-            tokens, tree_parents = window.tokens, window.parents
-        torch.cuda.synchronize()
-        spent = {"draft": time.perf_counter() - stage}
-        stages["draft"] += spent["draft"]
-        stage = time.perf_counter()
-        logits, record, *tapped = tree_forward(
-            w, _tokens(tokens, w.norm.device), tree_parents, st, capture_taps=draft is not None)
-        torch.cuda.synchronize()
-        spent["verify"] = time.perf_counter() - stage
-        stages["verify"] += spent["verify"]
-        stage = time.perf_counter()
-        if window is not None:
-            constraint.mask(logits, window)
-        depths, _ = _paths(tree_parents)
-        sampled = sample_rows(logits, [st.pos + d + 1 for d in depths], sampling)
-        children: dict[tuple[int, int], int] = {}
-        for row in range(1, len(tokens)):
-            children.setdefault((tree_parents[row], tokens[row]), row)
-        path = [0]
-        terminal = sampled[0]
-        stop = "length"
-        while len(out) + len(path) < count:
-            if stop_eos and terminal in w.config.eos:
-                stop = "eos"
-                break
-            child = children.get((path[-1], terminal))
-            if child is None:
-                stop = "miss"
-                break
-            path.append(child)
-            terminal = sampled[child]
-        if constraint is not None:
-            constraint.advance([tokens[row] for row in path[1:]] + [terminal])
-        spent["sample"] = time.perf_counter() - stage
-        stages["sample"] += spent["sample"]
-        if trace is not None:
-            trace.append(_round_record(tokens, tree_parents, depths, path, terminal, stop,
-                                       "copy" if copied else "tree", draft, spent))
-        stage = time.perf_counter()
-        commit(st, record, path)
-        if draft is not None:
-            draft.add_taps(tapped[0][path])
-        out.extend(tokens[row] for row in path[1:])
-        out.append(terminal)
-        context.extend(tokens[row] for row in path[1:])
-        context.append(terminal)
-        torch.cuda.synchronize()
-        stages["commit"] += time.perf_counter() - stage
-        if trace is not None:
-            trace[-1]["commit_ms"] = round(1000 * (time.perf_counter() - stage), 3)
-        if copied:                           # the verified window's rows: a grammar may have dropped some
-            copy_rows = next_copy_rows(copy_rows, len(path) == len(tokens), tree_rows, max_rows)
-        rounds += 1
-        drafted_rows += len(tokens) - 1
-        accepted_drafts += len(path) - 1
-        widths.append(len(tokens))
-        if on_tokens is not None:
-            stopped = bool(on_tokens([tokens[row] for row in path[1:]] + [terminal]))
+        round_ns, pos0 = nvtx.now(), st.pos
+        with nvtx.span("tensorfold.engine.iteration"):
+            with nvtx.span("tensorfold.engine.draft"):
+                stage = time.perf_counter()
+                copied = copies.propose(context, copy_rows - 1) if copies is not None else []
+                if copied:
+                    guesses = copied
+                    parents = list(range(-1, len(guesses) - 1))
+                elif draft is not None:
+                    guesses, parents = draft.propose_tree(
+                        out[-1], len(context), tree_rows - 1, sampling)
+                else:                                # no draft model: one row a round unless the context offers a copy
+                    guesses, parents = [], []
+                tokens = [out[-1]] + guesses
+                tree_parents = [-1] + [0 if p < 0 else p + 1 for p in parents]
+                window = None
+                if constraint is not None:           # a grammar drops drafts no path can keep, then masks each row by its path
+                    window = constraint.window(tokens, tree_parents)
+                    tokens, tree_parents = window.tokens, window.parents
+                torch.cuda.synchronize()
+                spent = {"draft": time.perf_counter() - stage}
+                stages["draft"] += spent["draft"]
+            with nvtx.span("tensorfold.engine.verify"):
+                stage = time.perf_counter()
+                logits, record, *tapped = tree_forward(
+                    w, _tokens(tokens, w.norm.device), tree_parents, st, capture_taps=draft is not None)
+                torch.cuda.synchronize()
+                spent["verify"] = time.perf_counter() - stage
+                stages["verify"] += spent["verify"]
+            with nvtx.span("tensorfold.sampling.d2h"):
+                stage = time.perf_counter()
+                if window is not None:
+                    constraint.mask(logits, window)
+                depths, _ = _paths(tree_parents)
+                sampled = sample_rows(logits, [st.pos + d + 1 for d in depths], sampling)
+                children: dict[tuple[int, int], int] = {}
+                for row in range(1, len(tokens)):
+                    children.setdefault((tree_parents[row], tokens[row]), row)
+                path = [0]
+                terminal = sampled[0]
+                stop = "length"
+                while len(out) + len(path) < count:
+                    if stop_eos and terminal in w.config.eos:
+                        stop = "eos"
+                        break
+                    child = children.get((path[-1], terminal))
+                    if child is None:
+                        stop = "miss"
+                        break
+                    path.append(child)
+                    terminal = sampled[child]
+                if constraint is not None:
+                    constraint.advance([tokens[row] for row in path[1:]] + [terminal])
+                spent["sample"] = time.perf_counter() - stage
+                stages["sample"] += spent["sample"]
+                if trace is not None:
+                    trace.append(_round_record(tokens, tree_parents, depths, path, terminal, stop,
+                                               "copy" if copied else "tree", draft, spent))
+            with nvtx.span("tensorfold.engine.commit"):
+                stage = time.perf_counter()
+                commit(st, record, path)
+                if draft is not None:
+                    draft.add_taps(tapped[0][path])
+                out.extend(tokens[row] for row in path[1:])
+                out.append(terminal)
+                context.extend(tokens[row] for row in path[1:])
+                context.append(terminal)
+                torch.cuda.synchronize()
+                stages["commit"] += time.perf_counter() - stage
+                if trace is not None:
+                    trace[-1]["commit_ms"] = round(1000 * (time.perf_counter() - stage), 3)
+            if copied:                           # the verified window's rows: a grammar may have dropped some
+                copy_rows = next_copy_rows(copy_rows, len(path) == len(tokens), tree_rows, max_rows)
+            rounds += 1
+            drafted_rows += len(tokens) - 1
+            accepted_drafts += len(path) - 1
+            widths.append(len(tokens))
+            if on_tokens is not None:
+                stopped = bool(on_tokens([tokens[row] for row in path[1:]] + [terminal]))
+        nvtx.record("round", round_ns, pos=pos0, rows=len(tokens), parents=tree_parents,
+                    source="copy" if copied else ("tree" if draft is not None else "serial"),
+                    accepted=len(path) - 1)
     return DecodeResult(out, time.perf_counter() - start, rounds, drafted_rows,
                         accepted_drafts, stages["draft"], stages["verify"],
                         stages["sample"], stages["commit"], widths)

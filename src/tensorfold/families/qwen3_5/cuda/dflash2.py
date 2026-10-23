@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from tensorfold.cuda import nvtx
 from tensorfold.cuda.direct_read import SafeTensors
 from tensorfold.engine.exact_sampling import Sampling
 
@@ -318,6 +319,10 @@ class DFlash2:
 
     @torch.no_grad()
     def add_taps(self, taps: torch.Tensor) -> None:
+        with nvtx.span("tensorfold.draft.taps"):
+            self._add_taps(taps)
+
+    def _add_taps(self, taps: torch.Tensor) -> None:
         if taps.ndim != 2 or taps.shape[1] != 5 * self.hidden:
             raise ValueError("DFlash2 expects five target layer taps per committed row")
         projected = _norm(self._lin(taps, "fc.weight"), self.weights["hidden_norm.weight"], self.eps)
@@ -564,4 +569,7 @@ class DFlash2:
     @torch.no_grad()
     def propose_tree(self, pending: int, context_length: int, max_nodes: int,
                      sampling: Sampling | None = None, block: int | None = None) -> tuple[list[int], list[int]]:
-        return self.finish_tree(self.launch_block(pending, max_nodes, block), context_length, max_nodes, sampling)[:2]
+        with nvtx.span("tensorfold.draft.launch"):
+            launched = self.launch_block(pending, max_nodes, block)
+        with nvtx.span("tensorfold.draft.tree"):
+            return self.finish_tree(launched, context_length, max_nodes, sampling)[:2]
