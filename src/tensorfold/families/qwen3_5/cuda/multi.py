@@ -6,6 +6,7 @@ import time
 
 import torch
 
+from tensorfold.cuda import nvtx
 from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
@@ -256,6 +257,8 @@ class MultiDecoder:
         if s.background or any(not x.done for x in self.streams.values()):   # a later foreground prompt waits one step
             stop = min(stop, pos + STEP)
         self._send([FILL, s.sid, stop])
+        if nvtx.ENABLED:
+            self._filled = [(s.sid, pos, stop)]
         try:
             first = self._step(s, stop)
         except Exception as exc:                 # noqa: BLE001  (one GPU: this request fails, the others go on)
@@ -290,6 +293,8 @@ class MultiDecoder:
         """``_fill`` for several prompts at once; on one GPU an error ends each of them alone, as one prompt's would."""
 
         self._send([FILLS, len(batch), *[x for s, stop in batch for x in (s.sid, stop)]])
+        if nvtx.ENABLED:
+            self._filled = [(s.sid, s.st.pos, stop) for s, stop in batch]
         try:
             firsts = self._steps(batch)
         except Exception as exc:                 # noqa: BLE001  (one GPU: these requests fail, the others go on)
@@ -394,13 +399,26 @@ class MultiDecoder:
     def round(self) -> list[Stream]:
         """A prefill step for the next queued prompt, then one round over the decoding streams; returns the finished."""
 
+        if not nvtx.ENABLED:
+            return self._round()
+        start_ns, self._filled, self._shapes = nvtx.now(), None, None
+        with nvtx.span("tensorfold.engine.iteration"):
+            done = self._round()
+        if self._filled is not None or self._shapes is not None:
+            nvtx.record("multi_round", start_ns, prefill=self._filled, streams=self._shapes)
+        return done
+
+    def _round(self) -> list[Stream]:
+
         self._check()
         self._timed(time.perf_counter())
-        done = self._fill() if self.filling else []
+        with nvtx.span("tensorfold.prefill.step"):
+            done = self._fill() if self.filling else []
         start = time.perf_counter()
         live = [s for s in self.streams.values() if not s.done]
         if self.memory_gate is not None:
-            done += self._make_room(live)
+            with nvtx.span("tensorfold.engine.memory"):
+                done += self._make_room(live)
             live = [s for s in live if not s.done and not s.waiting]
         if not live:
             self.last = None
@@ -415,7 +433,12 @@ class MultiDecoder:
             paths.append(path)
             ends.append(end)
         self._send([x for path in paths for x in (len(path), *path)])
-        self._commit(plan, wins, record, taps, starts, paths)
+        if nvtx.ENABLED:
+            self._shapes = [{"sid": s.sid, "pos": s.st.pos, "rows": len(tokens), "parents": parents,
+                             "mode": mode, "accepted": len(path) - 1}
+                            for s, (_, mode, _, _), (tokens, parents), path in zip(live, plan, wins, paths)]
+        with nvtx.span("tensorfold.engine.commit"):
+            self._commit(plan, wins, record, taps, starts, paths)
         self.last = (start, len(plan), sum(len(t) for t, _ in wins)) if self.costs is not None else None
         for s, (tokens, _), path, end in zip(live, wins, paths, ends):
             new = [tokens[r] for r in path[1:]] + [end]
@@ -526,12 +549,14 @@ class MultiDecoder:
         tree = [(sid, pending) for sid, mode, pending, _ in plan if mode == TREE] if self.drafts else []
         block = self.block if self.depth else self.max_rows    # one stream too: DFlash2 drafts best near 8 rows
         if tree:                                      # every stream's block in one drafter pass
-            launched = self.draft.launch_blocks([self.streams[sid].snap for sid, _ in tree],
-                                                [pending for _, pending in tree], self.max_rows - 1, block)
+            with nvtx.span("tensorfold.draft.launch"):
+                launched = self.draft.launch_blocks([self.streams[sid].snap for sid, _ in tree],
+                                                    [pending for _, pending in tree], self.max_rows - 1, block)
             blocks = {sid: block for (sid, _), block in zip(tree, launched)}
         grammars = {}
         if self.rank == 0:
-            wins = self._windows(plan, copied, blocks)
+            with nvtx.span("tensorfold.draft.tree"):
+                wins = self._windows(plan, copied, blocks)
             grammars = self._constrain(plan, wins)
             self._send([x for tokens, parents in wins for x in (len(tokens), *tokens, *parents)])
         else:
@@ -540,9 +565,10 @@ class MultiDecoder:
         self.block = self._deepest(plan, wins, block)
         states = [self.streams[item[0]].st for item in plan]
         taps_wanted = self.drafts and any(self.streams[item[0]].draft for item in plan)
-        logits, record, taps, starts = multi_tree_forward(
-            self.w, [(t, p, st) for (t, p), st in zip(wins, states)],
-            full_logits=self.split or self.rank == 0, tp=self.world == 2, capture_taps=taps_wanted)
+        with nvtx.span("tensorfold.engine.verify"):
+            logits, record, taps, starts = multi_tree_forward(
+                self.w, [(t, p, st) for (t, p), st in zip(wins, states)],
+                full_logits=self.split or self.rank == 0, tp=self.world == 2, capture_taps=taps_wanted)
         for k, window in grammars.items():          # a constrained stream's rows, each masked by its path
             self.streams[plan[k][0]].constraint.mask(logits[starts[k]:starts[k + 1]], window,
                                                      self.rank * self.w.head.n if self.split else 0)
@@ -552,7 +578,8 @@ class MultiDecoder:
             sampled = [_sample_split(logits[starts[k]:starts[k + 1]], positions[k], samplings[k], self.rank)
                        for k in range(len(plan))]
         else:
-            sampled = sample_streams(logits, starts, positions, samplings) if self.rank == 0 else [None] * len(plan)
+            with nvtx.span("tensorfold.sampling.d2h"):
+                sampled = sample_streams(logits, starts, positions, samplings) if self.rank == 0 else [None] * len(plan)
         return wins, record, taps, starts, sampled
 
     def _deepest(self, plan, wins, block: int) -> int:
@@ -606,7 +633,8 @@ class MultiDecoder:
                 drafting.append((s, taps.index_select(0, take)))
             s.counted(len(tokens))
         if drafting:                                  # every stream's kept rows into its drafter context, one pass
-            snaps = self.draft.add_taps_streams([s.snap for s, _ in drafting], [t for _, t in drafting])
+            with nvtx.span("tensorfold.draft.taps"):
+                snaps = self.draft.add_taps_streams([s.snap for s, _ in drafting], [t for _, t in drafting])
             for (s, _), snap in zip(drafting, snaps):
                 s.snap = snap
 
